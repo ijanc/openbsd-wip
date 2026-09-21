@@ -1,0 +1,11 @@
+Perl extensions for rxvt-unicode:
+
+	keyboard-select: select and copy text with vi-like keyboard
+	  shortcuts, including forward/backward search.
+
+	resize-font: change the font size at runtime with keyboard
+	  shortcuts, keeping bold/italic variants in sync.
+
+Enable them with URxvt.perl-ext-common in ~/.Xresources, see the
+comments at the top of each extension for the available keysyms and
+resources.
