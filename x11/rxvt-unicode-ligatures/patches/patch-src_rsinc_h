@@ -1,0 +1,16 @@
+ligatures and fontFeatures resources.
+
+Index: src/rsinc.h
+--- src/rsinc.h.orig
++++ src/rsinc.h
+@@ -15,6 +15,10 @@
+   def (boldItalicFont)
+   def (intensityStyles)
+ #endif
++#if HAVE_HARFBUZZ
++  def (ligatures)
++  def (fontFeatures)
++#endif
+   def (name)
+   def (title)
+   def (loginShell)

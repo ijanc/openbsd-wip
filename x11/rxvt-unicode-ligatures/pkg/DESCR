@@ -1,0 +1,25 @@
+rxvt-unicode is a customizable terminal emulator forked from rxvt.
+Features of rxvt-unicode include international language support through
+Unicode, transparency, the ability to display multiple font types and
+support for Perl extensions.
+
+This package adds text shaping with harfbuzz, 24-bit colour, wide
+glyphs (drawn over the next cell instead of clipped), improved font
+rendering and OSC 110/111/112 colour reset, and reverts line rewrapping
+to the 9.30 behaviour. Scrollbars, fading, pixbuf backgrounds and
+startup notification are disabled.
+
+Resources added:
+
+	ligatures (-lig/+lig): shape each run of text with harfbuzz
+	  so ligatures and contextual alternates from the font are
+	  used; only Xft fonts are shaped. Default off.
+
+	fontFeatures (-ff): comma separated list of OpenType features
+	  in harfbuzz syntax (liga, -dlig, ss01=1). Default
+	  liga,calt,dlig.
+
+	matcher.join-wrapped: join URLs split across rows by programs
+	  that wrap on their own. Default off.
+
+It conflicts with the x11/rxvt-unicode package.

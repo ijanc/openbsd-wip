@@ -1,0 +1,17 @@
+ligatures option (-lig/+lig).
+
+Index: src/optinc.h
+--- src/optinc.h.orig
++++ src/optinc.h
+@@ -54,6 +54,11 @@
+ #else
+  nodef(intensityStyles)
+ #endif
++#if HAVE_HARFBUZZ
++ def(ligatures)         // shape text runs with harfbuzz
++#else
++ nodef(ligatures)
++#endif
+ #if ISO_14755
+  def(iso14755)
+  def(iso14755_52)

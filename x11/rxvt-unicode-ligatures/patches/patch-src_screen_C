@@ -1,0 +1,336 @@
+Revert line rewrapping to the 9.30 behaviour (prompt placement after
+resize), 24-bit colour, wide glyphs, improved font rendering, harfbuzz
+shaping (rows are redrawn entirely when ligatures are enabled).
+
+Index: src/screen.C
+--- src/screen.C.orig
++++ src/screen.C
+@@ -293,7 +293,6 @@
+ 
+       int common_col = min (prev_ncol, ncol);
+ 
+-      // resize swap_buf, blank drawn_buf
+       for (int row = min (nrow, prev_nrow); row--; )
+         {
+           scr_blank_screen_mem (drawn_buf [row], DEFAULT_RSTYLE);
+@@ -307,7 +306,6 @@
+       int pend = MOD (term_start + top_row  , prev_total_rows);
+       int q    = total_rows; // rewrapped row
+ 
+-#if ENABLE_FRILLS
+       if ((rewrap_always || top_row) && !rewrap_never)
+         {
+           // Re-wrap lines. This is rather ugly, possibly because I am too dumb
+@@ -389,35 +387,38 @@
+               scr_blank_line (*qline, qline->l, ncol - qline->l, DEFAULT_RSTYLE);
+             }
+           while (p != pend && q > 0);
++
++          term_start = total_rows - nrow;
++          top_row = q - term_start;
++
++          // make sure all terminal lines exist
++          while (top_row > 0)
++            scr_blank_screen_mem (ROW (--top_row), DEFAULT_RSTYLE);
+         }
+       else
+-#endif
+         {
+-          // wing, instead of wrap
+-          screen.cur.row += nrow - prev_nrow;
+ 
+-          do
++          // if no scrollback exists (yet), wing, instead of wrap
++
++          for (int row = min (nrow, prev_nrow); row--; )
+             {
+-              p = MOD (p - 1, prev_total_rows);
+-              q--;
+ 
+-              copy_line (row_buf [q], prev_row_buf [p]);
++              line_t &src = prev_row_buf [MOD (term_start + row, prev_total_rows)];
++              line_t &dst = row_buf [row];
++
++              copy_line (dst, src);
+             }
+-          while (p != pend && q > 0);
+-        }
+ 
+-      term_start = total_rows - nrow;
+-      top_row = q - term_start;
++          for (int row = prev_nrow; row < nrow; row++)
++            scr_blank_screen_mem (row_buf [row], DEFAULT_RSTYLE);
+ 
+-      // make sure all terminal lines exist
+-      while (top_row > 0)
+-        scr_blank_screen_mem (ROW (--top_row), DEFAULT_RSTYLE);
++          term_start = 0;
++        }
+ 
+       clamp_it (screen.cur.row, 0, nrow - 1);
+       clamp_it (screen.cur.col, 0, ncol - 1);
+     }
+ 
+-  // ensure drawn_buf, swap_buf and terminal rows are all initialized
+   for (int row = nrow; row--; )
+     {
+       if (!ROW       (row).valid ()) scr_blank_screen_mem (ROW       (row), DEFAULT_RSTYLE);
+@@ -627,12 +628,51 @@
+     rstyle = SET_BGCOLOR (rstyle, color);
+ }
+ 
++#if USE_24_BIT_COLOR
++static rxvt_color *scr_colors[1 << 24];
++
++void
++rxvt_term::scr_color_24 (unsigned int color, int fgbg) noexcept
++{
++  color += TOTAL_COLORS;
++  if (fgbg == Color_fg)
++    rstyle = SET_FGCOLOR (rstyle, color);
++  else
++    rstyle = SET_BGCOLOR (rstyle, color);
++}
++
++void
++rxvt_term::scr_color_rgb (unsigned int r, unsigned int g, unsigned int b, int fgbg) noexcept
++{
++  unsigned int color = (r << 16) + (g << 8) + b;
++  scr_color_24(color, fgbg);
++}
++#endif
++
++rxvt_color
++&rxvt_term::lookup_color (unsigned int color, rxvt_color *table) noexcept
++{
++#if USE_24_BIT_COLOR
++  if (color >= TOTAL_COLORS) {
++    color -= TOTAL_COLORS;
++    if (scr_colors[color] == NULL) {
++        scr_colors[color] = new rxvt_color();
++        char name[1+2*3+1];
++        sprintf(name, "#%02x%02x%02x", (color >> 16) & 0xff, (color >> 8) & 0xff, color & 0xff);
++        scr_colors[color]->set(this, name);
++    }
++    return *scr_colors[color];
++  } else
++#endif
++  return table[color];
++}
++
+ /* ------------------------------------------------------------------------- */
+ /*
+  * Change the rendition style for following text
+  */
+ void
+-rxvt_term::scr_rendition (int set, int style) noexcept
++rxvt_term::scr_rendition (int set, rend_t style) noexcept
+ {
+   if (set)
+     rstyle |= style;
+@@ -937,7 +977,61 @@
+ # endif
+ #endif
+ 
+-          rend_t rend = SET_FONT (rstyle, FONTSET (rstyle)->find_font (c));
++          rend_t rend;
++#if ENABLE_WIDE_GLYPHS
++          // Re-use previous font for space characters.
++          // This allows for better display of wider chars with regard to
++          // backtracking (which uses RS_SAME).
++          if (c != ' ')
++            {
++#endif
++            rend = SET_FONT (rstyle, FONTSET (rstyle)->find_font (c));
++#if ENABLE_WIDE_GLYPHS
++
++            }
++          else
++            {
++              // Code taken from ENABLE_COMBINING - might get refactored.
++              line_t *linep;
++              text_t *tp;
++              rend_t *rp = NULL;
++
++              if (screen.cur.col > 0)
++                {
++                  linep = line;
++                  tp = line->t + screen.cur.col - 1;
++                  rp = line->r + screen.cur.col - 1;
++                }
++              else if (screen.cur.row > 0
++                       && ROW(screen.cur.row - 1).is_longer ())
++                {
++                  linep = &ROW(screen.cur.row - 1);
++                  tp = linep->t + ncol - 1;
++                  rp = linep->r + ncol - 1;
++                }
++
++              if (rp)
++                {
++                  // XXX: this font does not show up in iso-14755 mode for the space!?
++                  if (*tp == NOCHAR)
++                    {
++                      while (*tp == NOCHAR && tp > linep->t)
++                        tp--, rp--;
++
++                      // first try to find a precomposed character
++                      unicode_t n = rxvt_compose (*tp, c);
++                      if (n == NOCHAR)
++                        n = rxvt_composite.compose (*tp, c);
++
++                      *tp = n;
++                      *rp = SET_FONT (*rp, FONTSET (*rp)->find_font (*tp));
++                    }
++                  rend = SET_FONT (rstyle, GET_FONT(*rp));
++                }
++              else
++                rend = SET_FONT (rstyle, FONTSET (rstyle)->find_font (c));
++            }
++#endif
+ 
+           // if the character doesn't fit into the remaining columns...
+           if (ecb_unlikely (screen.cur.col > ncol - width && ncol >= width))
+@@ -1390,13 +1484,13 @@
+ 
+       if (mapped)
+         {
+-          gcvalue.foreground = pix_colors[bgcolor_of (rstyle)];
++          gcvalue.foreground = lookup_color(bgcolor_of (rstyle), pix_colors);
+           XChangeGC (dpy, gc, GCForeground, &gcvalue);
+           XFillRectangle (dpy, vt, gc,
+                           0, Row2Pixel (row - view_start),
+                           (unsigned int)vt_width,
+                           (unsigned int)Height2Pixel (num));
+-          gcvalue.foreground = pix_colors[Color_fg];
++          gcvalue.foreground = lookup_color(Color_fg, pix_colors);
+           XChangeGC (dpy, gc, GCForeground, &gcvalue);
+         }
+     }
+@@ -1725,15 +1819,15 @@
+         }
+       else
+ #endif
+-      ::swap (pix_colors[Color_fg], pix_colors[Color_bg]);
++      ::swap (lookup_color(Color_fg, pix_colors), lookup_color(Color_bg, pix_colors));
+ #ifdef HAVE_IMG
+       if (bg_img == 0)
+ #endif
+-          XSetWindowBackground (dpy, vt, pix_colors[Color_bg]);
++          XSetWindowBackground (dpy, vt, lookup_color(Color_bg, pix_colors));
+ 
+       XGCValues gcvalue;
+-      gcvalue.foreground = pix_colors[Color_fg];
+-      gcvalue.background = pix_colors[Color_bg];
++      gcvalue.foreground = lookup_color(Color_fg, pix_colors);
++      gcvalue.background = lookup_color(Color_bg, pix_colors);
+       XChangeGC (dpy, gc, GCBackground | GCForeground, &gcvalue);
+ 
+       scr_clear ();
+@@ -2244,6 +2338,22 @@
+        */
+       int ypixel = (int)Row2Pixel (row);
+ 
++#if HAVE_HARFBUZZ
++      // shaped runs must not be split by the partial redraw below, or a
++      // ligature could be drawn from only some of its characters.
++      // redraw the whole row if anything in it changed.
++      if (option (Opt_ligatures))
++        {
++          for (col = 0; col < ncol; col++)
++            if (stp[col] != dtp[col] || !RS_SAME (srp[col], drp[col]))
++              break;
++
++          if (col < ncol)
++            for (col = 0; col < ncol; col++)
++              drp[col] = srp[col] ^ RS_redraw;
++        }
++#endif
++
+       for (col = 0; col < ncol; col++)
+         {
+           /* compare new text with old - if exactly the same then continue */
+@@ -2396,7 +2506,12 @@
+                 text--, count++, xpixel -= fwidth;
+ 
+               // force redraw after "careful" characters to avoid pixel droppings
+-              for (int i = 0; srp[col + i] & RS_Careful && col + i < ncol - 1; i++)
++              for (int i = 0; srp[col + i] & RS_Careful && col + i < ncol - 1
++#if ENABLE_WIDE_GLYPHS
++              // But not for spaces.
++                      && stp[col + i + 1] != ' '
++#endif
++                      ; i++)
+                 drp[col + i + 1] = srp[col + i + 1] ^ RS_redraw;
+ 
+               // force redraw before "careful" characters to avoid pixel droppings
+@@ -2431,18 +2546,18 @@
+             {
+               if (showcursor && focus && row == screen.cur.row
+                   && IN_RANGE_EXC (col, cur_col, cur_col + cursorwidth))
+-                XSetForeground (dpy, gc, pix_colors[ccol1]);
++                XSetForeground (dpy, gc, lookup_color(ccol1, pix_colors));
+               else
+ #if ENABLE_FRILLS
+               if (ISSET_PIXCOLOR (Color_underline))
+-                XSetForeground (dpy, gc, pix_colors[Color_underline]);
++                XSetForeground (dpy, gc, lookup_color(Color_underline, pix_colors));
+               else
+ #endif
+-                XSetForeground (dpy, gc, pix_colors[fore]);
++                XSetForeground (dpy, gc, lookup_color(fore, pix_colors));
+ 
+               XDrawLine (dpy, vt, gc,
+-                         xpixel, ypixel + font->ascent + 1,
+-                         xpixel + Width2Pixel (count) - 1, ypixel + font->ascent + 1);
++                         xpixel, ypixel + Height2Pixel (1) - 1,
++                         xpixel + Width2Pixel (count) - 1, ypixel + Height2Pixel (1) - 1);
+             }
+         }                     /* for (col....) */
+     }                         /* for (row....) */
+@@ -2458,7 +2573,7 @@
+             scr_set_char_rend (ROW(screen.cur.row), cur_col, cur_rend);
+           else if (oldcursor.row >= 0)
+             {
+-              XSetForeground (dpy, gc, pix_colors[ccol1]);
++              XSetForeground (dpy, gc, lookup_color(ccol1, pix_colors));
+               if (cursor_type == 1)
+                 XFillRectangle (dpy, vt, gc,
+                                 Col2Pixel (cur_col),
+@@ -2475,7 +2590,7 @@
+         }
+       else if (oldcursor.row >= 0)
+         {
+-          XSetForeground (dpy, gc, pix_colors[ccol1]);
++          XSetForeground (dpy, gc, lookup_color(ccol1, pix_colors));
+ 
+           XDrawRectangle (dpy, vt, gc,
+                           Col2Pixel (cur_col),
+@@ -2544,15 +2659,15 @@
+       else
+ # endif
+         {
+-          XSetWindowBackground (dpy, parent, pix_colors[Color_border]);
++          XSetWindowBackground (dpy, parent, lookup_color(Color_border, pix_colors));
+           XSetWindowBackgroundPixmap (dpy, vt, bg_img->pm);
+         }
+     }
+   else
+ #endif
+     {
+-      XSetWindowBackground (dpy, parent, pix_colors[Color_border]);
+-      XSetWindowBackground (dpy, vt, pix_colors[Color_bg]);
++      XSetWindowBackground (dpy, parent, lookup_color(Color_border, pix_colors));
++      XSetWindowBackground (dpy, vt, lookup_color(Color_bg, pix_colors));
+     }
+ 
+   XClearWindow (dpy, parent);
+@@ -2562,7 +2677,7 @@
+       if (transparent)
+         XSetWindowBackgroundPixmap (dpy, scrollBar.win, ParentRelative);
+       else
+-        XSetWindowBackground (dpy, scrollBar.win, pix_colors[scrollBar.color ()]);
++        XSetWindowBackground (dpy, scrollBar.win, lookup_color(scrollBar.color (), pix_colors));
+       scrollBar.state = SB_STATE_IDLE;
+       scrollBar.show (0);
+     }

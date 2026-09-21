@@ -1,0 +1,513 @@
+24-bit colour, wide glyphs, improved font rendering (cell metrics
+from Xft, glyphs probed per font instead of per face), keep symbol
+fallback fonts that have none of the width test characters, text
+shaping with harfbuzz (ligatures, contextual alternates).
+
+Index: src/rxvtfont.C
+--- src/rxvtfont.C.orig
++++ src/rxvtfont.C
+@@ -32,6 +32,10 @@
+ # include <fontconfig/fontconfig.h>
+ #endif
+ 
++#if HAVE_HARFBUZZ
++# include <hb.h>
++#endif
++
+ #define MAX_OVERLAP_ROMAN  (8 + 2)	// max. character width in 8ths of the base width
+ #define MAX_OVERLAP_ITALIC (8 + 3)	// max. overlap for italic fonts
+ 
+@@ -243,20 +247,20 @@
+ 
+ # ifdef HAVE_IMG
+       if (term->bg_img
+-          && !term->pix_colors[color].is_opaque ()
++          && !term->lookup_color(color, term->pix_colors).is_opaque ()
+           && ((dst = XftDrawPicture (d))))
+         {
+           XClearArea (disp, d, x, y, w, h, false);
+ 
+-          Picture solid_color_pict = XftDrawSrcPicture (d, &term->pix_colors[color].c);
++          Picture solid_color_pict = XftDrawSrcPicture (d, &term->lookup_color(color, term->pix_colors).c);
+           XRenderComposite (disp, PictOpOver, solid_color_pict, None, dst, 0, 0, 0, 0, x, y, w, h);
+         }
+       else
+ # endif
+-        XftDrawRect (d, &term->pix_colors[color].c, x, y, w, h);
++        XftDrawRect (d, &term->lookup_color(color, term->pix_colors).c, x, y, w, h);
+ 
+ #else
+-      XSetForeground (disp, gc, term->pix_colors[color]);
++      XSetForeground (disp, gc, term->lookup_color(color, term->pix_colors));
+       XFillRectangle (disp, d, gc, x, y, w, h);
+ #endif
+     }
+@@ -343,7 +347,7 @@
+ 
+   clear_rect (d, x, y, term->fwidth * len, term->fheight, bg);
+ 
+-  XSetForeground (disp, gc, term->pix_colors[fg]);
++  XSetForeground (disp, gc, term->lookup_color(fg, term->pix_colors));
+ 
+   while (len)
+     {
+@@ -471,6 +475,7 @@
+       else
+         switch (t)
+           {
++            case ' ':
+             case '\t':
+             case ZERO_WIDTH_CHAR:
+             case NOCHAR:
+@@ -1038,8 +1043,10 @@
+ 
+   careful = xcs->lbearing < 0 || xcs->rbearing > prop->width * wcw;
+ 
++#if !ENABLE_WIDE_GLYPHS
+   if (careful && !OVERLAP_OK (w, wcw, prop))
+     return false;
++#endif
+ 
+   return true;
+ }
+@@ -1065,7 +1072,7 @@
+   int base = ascent; // sorry, incorrect: term->fbase;
+ 
+   XGCValues v;
+-  v.foreground = term->pix_colors[fg];
++  v.foreground = term->lookup_color(fg, term->pix_colors);
+   v.font = f->fid;
+ 
+   if (enc2b)
+@@ -1074,7 +1081,7 @@
+ 
+       if (bg == Color_bg && !slow)
+         {
+-          v.background = term->pix_colors[bg];
++          v.background = term->lookup_color(bg, term->pix_colors);
+           XChangeGC (disp, gc, GCForeground | GCBackground | GCFont, &v);
+           XDrawImageString16 (disp, d, gc, x, y + base, xc, len);
+         }
+@@ -1106,7 +1113,7 @@
+ 
+       if (bg == Color_bg && !slow)
+         {
+-          v.background = term->pix_colors[bg];
++          v.background = term->lookup_color(bg, term->pix_colors);
+           XChangeGC (disp, gc, GCForeground | GCBackground | GCFont, &v);
+           XDrawImageString (disp, d, gc, x, y + base, xc, len);
+         }
+@@ -1154,6 +1161,10 @@
+   rxvt_font_xft ()
+   {
+     f = 0;
++#if HAVE_HARFBUZZ
++    hbf = 0;
++    nfeatures = 0;
++#endif
+   }
+ 
+   void clear ();
+@@ -1170,6 +1181,17 @@
+ 
+ protected:
+   XftFont *f;
++
++#if HAVE_HARFBUZZ
++  enum { max_features = 16 };
++
++  hb_font_t *hbf;
++  hb_feature_t features [max_features];
++  unsigned int nfeatures;
++
++  void load_hb (FcPattern *match);
++  bool shape (XftGlyphSpec *&ep, int x_, int y_, const text_t *text, int len);
++#endif
+ };
+ 
+ void
+@@ -1180,8 +1202,158 @@
+       XftFontClose (term->dpy, f);
+       f = 0;
+     }
++
++#if HAVE_HARFBUZZ
++  if (hbf)
++    {
++      hb_font_destroy (hbf);
++      hbf = 0;
++    }
++#endif
++}
++
++#if HAVE_HARFBUZZ
++// open the matched font file directly with harfbuzz. glyph indices are
++// shared with xft, which lets us feed shaped glyphs into XftDrawGlyphSpec.
++void
++rxvt_font_xft::load_hb (FcPattern *match)
++{
++  FcChar8 *file;
++  int index = 0;
++  double pixelsize = 0;
++
++  if (FcPatternGetString (match, FC_FILE, 0, &file) != FcResultMatch)
++    return;
++
++  FcPatternGetInteger (match, FC_INDEX, 0, &index);
++  FcPatternGetDouble (match, FC_PIXEL_SIZE, 0, &pixelsize);
++
++  // bitmap fonts get scaled by xft, scale the shaper output the same way
++  double fixup;
++  if (FcPatternGetDouble (match, "pixelsizefixupfactor", 0, &fixup) == FcResultMatch)
++    pixelsize *= fixup;
++
++  hb_blob_t *blob = hb_blob_create_from_file ((const char *)file);
++
++  if (blob == hb_blob_get_empty ())
++    return;
++
++  hb_face_t *face = hb_face_create (blob, index & 0xffff);
++  hb_blob_destroy (blob);
++
++  hbf = hb_font_create (face);
++  hb_face_destroy (face);
++
++  int scale = (int)(pixelsize * 64. + .5);
++  hb_font_set_scale (hbf, scale, scale);
++
++  nfeatures = 0;
++
++  const char *spec = term->rs[Rs_fontFeatures];
++  if (!spec || !*spec)
++    spec = "liga,calt,dlig";
++
++  while (*spec && nfeatures < max_features)
++    {
++      const char *end = strchr (spec, ',');
++      int len = end ? end - spec : strlen (spec);
++
++      if (len && hb_feature_from_string (spec, len, &features [nfeatures]))
++        ++nfeatures;
++      else if (len)
++        rxvt_warn ("unable to parse font feature '%.*s', ignoring.\n", len, spec);
++
++      spec += end ? len + 1 : len;
++    }
+ }
+ 
++bool
++rxvt_font_xft::shape (XftGlyphSpec *&ep, int x_, int y_, const text_t *text, int len)
++{
++  static hb_buffer_t *buf;
++
++  if (!buf)
++    buf = hb_buffer_create ();
++
++  hb_buffer_clear_contents (buf);
++
++  // cluster values are cell indices, NOCHAR cells belong to the preceding glyph
++  for (int i = 0; i < len; ++i)
++    if (text [i] != NOCHAR)
++      hb_buffer_add (buf, text [i], i);
++
++  hb_buffer_set_content_type (buf, HB_BUFFER_CONTENT_TYPE_UNICODE);
++  hb_buffer_guess_segment_properties (buf);
++  // the grid is always left to right
++  hb_buffer_set_direction (buf, HB_DIRECTION_LTR);
++
++  hb_shape (hbf, buf, features, nfeatures);
++
++  unsigned int n;
++  hb_glyph_info_t *info = hb_buffer_get_glyph_infos (buf, &n);
++  hb_glyph_position_t *pos = hb_buffer_get_glyph_positions (buf, 0);
++
++  dTermDisplay;
++
++  // advances come from xft so that shaped and unshaped text line up
++  // exactly, harfbuzz only contributes glyph ids and positioning offsets.
++  // rxvt_temp_buf is already in use by the caller for the glyph specs.
++  int xoff [n];
++
++  int ybase = y_ + term->fbase + (term->lineSpace >> 1);
++
++  for (unsigned int i = 0; i < n; )
++    {
++      unsigned int cluster = info [i].cluster;
++
++      // glyphs of one cluster are positioned as a group
++      unsigned int j = i;
++      int advance = 0;
++
++      while (j < n && info [j].cluster == cluster)
++        {
++          FT_UInt glyph = info [j].codepoint;
++
++          if (!glyph)
++            return false; // .notdef, let the per-character path handle it
++
++          XGlyphInfo extents;
++          XftGlyphExtents (disp, f, &glyph, 1, &extents);
++
++          xoff [j] = extents.xOff;
++          advance += extents.xOff;
++          ++j;
++        }
++
++      // cells covered by this cluster: up to the next cluster or end of run
++      int span = (j < n ? (int)info [j].cluster : len) - cluster;
++      int cwidth = term->fwidth * span;
++
++      if (text [cluster] != ' ')
++        {
++          int pen = x_ + term->fwidth * cluster;
++
++          // center within the covered cells, like the per-character path
++          pen += advance ? cwidth - advance >> 1 : 0;
++
++          for (; i < j; ++i)
++            {
++              ep->glyph = info [i].codepoint;
++              ep->x = pen + (pos [i].x_offset >> 6);
++              ep->y = ybase - (pos [i].y_offset >> 6);
++              ++ep;
++
++              pen += xoff [i];
++            }
++        }
++
++      i = j;
++    }
++
++  return true;
++}
++#endif
++
+ rxvt_fontprop
+ rxvt_font_xft::properties ()
+ {
+@@ -1250,100 +1422,65 @@
+     return false;
+ 
+   int ftheight = 0;
+-  bool success = true;
++  p = FcPatternDuplicate (match);
++  f = XftFontOpenPattern (disp, p);
+ 
+-  for (;;)
++  if (!f)
+     {
+-      p = FcPatternDuplicate (match);
+-      f = XftFontOpenPattern (disp, p);
+-
+-      if (!f)
+-        {
+-          FcPatternDestroy (p);
+-          success = false;
+-          break;
+-        }
+-
+-      FT_Face face = XftLockFace (f);
+-
+-      // fuck me plenty: XftLockFace can actually return 0. try not to crash.
+-      // we also assume blindly that if the first lock succeeeds, then subsequent
+-      // locks will also succeed.
+-      if (!face)
+-        {
+-          XftFontClose (disp, f);
+-          success = false;
+-          break;
+-        }
+-
+-      ascent  = (face->size->metrics.ascender + 63) >> 6;
+-      descent = (-face->size->metrics.descender + 63) >> 6;
+-      height  = max (ascent + descent, (face->size->metrics.height + 63) >> 6);
+-      width   = 0;
+-
+-      bool scalable = face->face_flags & FT_FACE_FLAG_SCALABLE;
+-
+-      XftUnlockFace (f);
+-
+-      int glheight = height;
+-
+-      for (uint16_t *t = extent_test_chars; t < extent_test_chars + ecb_array_length (extent_test_chars); t++)
+-        {
+-          FcChar16 ch = *t;
++      FcPatternDestroy (p);
++      return false;
++    }
+ 
+-          if (cs != CS_UNICODE
+-              && ch > 0x100
+-              && FROM_UNICODE (cs, ch) == NOCHAR)
+-            continue;
++  FT_Face face = XftLockFace (f);
+ 
+-          // ignore characters we wouldn't use anyways
+-          bool careful;
+-          if (!has_char (*t, &prop, careful))
+-            continue;
++  ascent  = f->ascent;
++  descent = f->descent;
++  height  = max (ascent + descent, f->height);
++  width   = 0;
+ 
+-          XGlyphInfo g;
+-          XftTextExtents16 (disp, f, &ch, 1, &g);
++  bool scalable = face->face_flags & FT_FACE_FLAG_SCALABLE;
+ 
+-          g.width -= g.x;
++  XftUnlockFace (f);
+ 
+-          int wcw = WCWIDTH (ch);
+-          if (wcw > 0) g.width = (g.width + wcw - 1) / wcw;
++  for (uint16_t *t = extent_test_chars; t < extent_test_chars + ecb_array_length (extent_test_chars); t++)
++    {
++      FcChar16 ch = *t;
+ 
+-          if (width    < g.width       ) width    = g.width;
+-          if (height   < g.height      ) height   = g.height;
+-          if (glheight < g.height - g.y) glheight = g.height - g.y;
+-        }
++      if (cs != CS_UNICODE
++          && ch > 0x100
++          && FROM_UNICODE (cs, ch) == NOCHAR)
++        continue;
+ 
+-      if (!width)
+-        {
+-          rxvt_warn ("unable to calculate font width for '%s', using max_advance_width.\n", name);
+-          width = f->max_advance_width;
+-          break;
+-        }
++      // ignore characters we wouldn't use anyways
++      bool careful;
++      if (!has_char (*t, &prop, careful))
++        continue;
+ 
+-      if (prop.height == rxvt_fontprop::unset
+-          || (height <= prop.height && glheight <= prop.height)
+-          || height <= 2
+-          || !scalable)
+-        break;
++      XGlyphInfo g;
++      XftTextExtents16 (disp, f, &ch, 1, &g);
+ 
+-      if (ftheight)
+-        {
+-          // take smaller steps near the end
+-          if (height > prop.height + 1) ftheight++;
+-          if (height > prop.height + 2) ftheight++;
+-          if (height > prop.height + 3) ftheight++;
++      g.width -= g.x;
+ 
+-          ftheight -= height - prop.height;
+-        }
+-      else
+-        ftheight = prop.height - 1;
++      int wcw = WCWIDTH (ch);
++      if (wcw > 1) g.xOff = g.xOff / wcw;
++      if (width    < g.xOff  ) width    = g.xOff;
++      if (height   < g.height) height   = g.height;
++    }
++  bool success = true;
+ 
+-      XftFontClose (disp, f);
+-      FcPatternDel (match, FC_PIXEL_SIZE);
+-      FcPatternAddInteger (match, FC_PIXEL_SIZE, ftheight);
++  // fonts without any of the test characters (symbol and icon fonts used
++  // as fallbacks) still have a usable advance width
++  if (!width)
++    {
++      rxvt_warn ("unable to calculate font width for '%s', using max_advance_width.\n", name);
++      width = f->max_advance_width;
+     }
+ 
++#if HAVE_HARFBUZZ
++  if (success)
++    load_hb (match);
++#endif
++
+   FcPatternDestroy (match);
+ 
+ #if 0 // do it per-character
+@@ -1410,12 +1547,14 @@
+ 
+   careful = g.x > 0 || w > cwidth;
+ 
++#if !ENABLE_WIDE_GLYPHS
+   if (careful && !OVERLAP_OK (w, wcw, prop))
+     return false;
+ 
+   // this weeds out _totally_ broken fonts, or glyphs
+   if (!OVERLAP_OK (g.xOff, wcw, prop))
+     return false;
++#endif
+ 
+   return true;
+ }
+@@ -1444,6 +1583,13 @@
+   int x_ = buffered ? 0 : x;
+   int y_ = buffered ? 0 : y;
+ 
++#if HAVE_HARFBUZZ
++  if (hbf && len > 1 && term->option (Opt_ligatures) && shape (ep, x_, y_, text, len))
++    len = 0;
++  else
++    ep = enc;
++#endif
++
+   while (len)
+     {
+       int cwidth = term->fwidth;
+@@ -1496,7 +1642,11 @@
+ 
+           ep->glyph = glyph;
+           ep->x = x_;
+-          ep->y = y_ + ascent;
++#if ENABLE_WIDE_GLYPHS
++          /* Left-align to bounding box, do not overlap to the left. */
++          max_it(ep->x, x_);
++#endif
++          ep->y = y_ + term->fbase + (term->lineSpace >> 1);
+ 
+           // the xft font cell might differ from the terminal font cell,
+           // in which case we use the average between the two.
+@@ -1528,7 +1678,7 @@
+ 
+           if (term->bg_img
+               && (bg == Color_transparent || bg == Color_bg
+-                  || (bg >= 0 && !term->pix_colors[bg].is_opaque () && ((dst = XftDrawPicture (d2))))))
++                  || (bg >= 0 && !term->lookup_color(bg, term->pix_colors).is_opaque () && ((dst = XftDrawPicture (d2))))))
+             {
+               int src_x = x, src_y = y;
+ 
+@@ -1565,7 +1715,7 @@
+ 
+               if (dst)
+                 {
+-                  Picture solid_color_pict = XftDrawSrcPicture (d2, &term->pix_colors[bg].c);
++                  Picture solid_color_pict = XftDrawSrcPicture (d2, &term->lookup_color(bg, term->pix_colors).c);
+ 
+                   // dst can only be set when bg >= 0
+                   XRenderComposite (disp, PictOpOver, solid_color_pict, None, dst, 0, 0, 0, 0, 0, 0, w, h);
+@@ -1573,9 +1723,9 @@
+             }
+           else
+ #endif
+-            XftDrawRect (d2, &term->pix_colors[bg >= 0 ? bg : Color_bg].c, 0, 0, w, h);
++            XftDrawRect (d2, &term->lookup_color(bg >= 0 ? bg : Color_bg, term->pix_colors).c, 0, 0, w, h);
+ 
+-          XftDrawGlyphSpec (d2, &term->pix_colors[fg].c, f, enc, ep - enc);
++          XftDrawGlyphSpec (d2, &term->lookup_color(fg, term->pix_colors).c, f, enc, ep - enc);
+           XCopyArea (disp, d2, d, gc, 0, 0, w, h, x, y);
+         }
+       else
+@@ -1584,7 +1734,7 @@
+   else
+     {
+       clear_rect (d, x, y, w, h, bg);
+-      XftDrawGlyphSpec (d, &term->pix_colors[fg].c, f, enc, ep - enc);
++      XftDrawGlyphSpec (d, &term->lookup_color(fg, term->pix_colors).c, f, enc, ep - enc);
+     }
+ }
+ 

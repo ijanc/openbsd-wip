@@ -1,0 +1,30 @@
+ligatures and fontFeatures resources, wide-glyphs and harfbuzz in the
+feature list.
+
+Index: src/xdefaults.C
+--- src/xdefaults.C.orig
++++ src/xdefaults.C
+@@ -204,6 +204,10 @@
+               STRG (Rs_boldItalicFont, "boldItalicFont", "fbi", "fontname", "bold italic font"),
+               BOOL (Rs_intensityStyles, "intensityStyles", "is", Opt_intensityStyles, 0, "font styles imply intensity changes"),
+ #endif
++#if HAVE_HARFBUZZ
++              BOOL (Rs_ligatures, "ligatures", "lig", Opt_ligatures, 0, "shape text runs with harfbuzz (ligatures)"),
++              STRG (Rs_fontFeatures, "fontFeatures", "ff", "string", "comma separated opentype features (default: liga,calt,dlig)"),
++#endif
+ #if USE_XIM
+               STRG (Rs_inputMethod, "inputMethod", "im", "name", "name of input method"),
+               STRG (Rs_preeditType, "preeditType", "pt", "style", "input style: style = OverTheSpot|OffTheSpot|Root"),
+@@ -299,6 +303,12 @@
+ #if ENABLE_STYLES
+                                     "styles,"
+ #endif
++#if ENABLE_WIDE_GLYPHS
++                                    "wide-glyphs,"
++#endif
++#if HAVE_HARFBUZZ
++                                    "harfbuzz,"
++#endif
+ #if ENABLE_COMBINING
+                                     "combining,"
+ #endif

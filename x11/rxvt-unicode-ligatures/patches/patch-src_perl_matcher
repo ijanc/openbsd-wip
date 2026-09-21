@@ -1,0 +1,219 @@
+matcher.join-wrapped: join URLs split across rows by programs that
+wrap on their own (pagers, mail and feed readers, full screen apps).
+
+Index: src/perl/matcher
+--- src/perl/matcher.orig
++++ src/perl/matcher
+@@ -9,6 +9,7 @@
+ #:META:RESOURCE:%.pattern.:string:extra pattern to match
+ #:META:RESOURCE:%.launcher.:string:custom launcher for pattern
+ #:META:RESOURCE:%.rend.:string:custom rendition for pattern
++#:META:RESOURCE:%.join-wrapped:boolean:join matches split across hard-wrapped rows
+ 
+ =head1 NAME
+ 
+@@ -88,6 +89,23 @@
+     URxvt.matcher.pattern.2:  \\B(/\\S+?):(\\d+)(?=:|$)
+     URxvt.matcher.launcher.2: gvim +$2 $1
+ 
++=head2 Hard-wrapped matches
++
++Matches spanning rows that were wrapped by the terminal itself are handled
++transparently. Programs that wrap output on their own (pagers, mail and
++feed readers, markdown renderers, full screen applications) emit separate
++rows instead, which splits a long URL into two or more matches.
++
++With the C<matcher.join-wrapped> resource enabled, a match that ends at the
++last non-blank column of a row that is as wide as the longest visible row is
++joined with the leading token of the following row, as long as the result
++still matches the pattern. The joined text is used for the launcher and
++the rendition, the rows are displayed unchanged. Leading whitespace on the
++continuation row is skipped, wrap markers (such as the C<+> of neomutt) are
++not and should be disabled in the application.
++
++    URxvt.matcher.join-wrapped: true
++
+ =head2 Regex encoding/wide character matching
+ 
+ Urxvt stores all text as unicode, in a special encoding that uses
+@@ -186,8 +204,10 @@
+       my $line = $self->line ($row);
+       my @matches = $self->find_matches ($row);
+ 
+-      for (sort { $b->[0] <=> $a->[0] or $b->[1] <=> $a->[1] } @matches) {
+-         push @{ $self->{matches} }, $_;
++      for my $match (sort { $b->[0] <=> $a->[0] or $b->[1] <=> $a->[1] } @matches) {
++         # a joined match is found from every row it spans
++         next if grep $_->[0] == $match->[0] && $_->[1] == $match->[1], @{ $self->{matches} };
++         push @{ $self->{matches} }, $match;
+          last if @{ $self->{matches} } == 10;
+       }
+ 
+@@ -294,6 +314,8 @@
+    }
+    $self->{matchers} = \@matchers;
+ 
++   $self->{join_wrapped} = $self->my_resource ("join-wrapped") =~ /^(?:true|on|yes|1)$/i;
++
+    ()
+ }
+ 
+@@ -302,19 +324,26 @@
+ 
+    # fetch the line that has changed
+    my $line = $self->line ($row);
+-   my $text = $line->t;
++   my ($text, $seg) = $self->joined_line ($row);
++   my ($s) = grep $_->{line}->beg == $line->beg, @$seg;
+    my $rend;
+ 
+    # find all urls (if any)
+    for my $matcher (@{$self->{matchers}}) {
+       while ($text =~ /$matcher->[0]/g) {
+          #print "$&\n";
++
++         # part of the match within this line
++         my $beg = $-[0] < $s->{start} ? $s->{start} : $-[0];
++         my $end = $+[0] > $s->{start} + $s->{len} ? $s->{start} + $s->{len} : $+[0];
++         next if $beg >= $end;
++
+          $rend ||= $line->r;
+ 
+          # mark all characters as underlined. we _must_ not toggle underline,
+          # as we might get called on an already-marked url.
+          &{$matcher->[2]}
+-            for @{$rend}[$-[0] .. $+[0] - 1];
++            for @{$rend}[$beg - $s->{start} + $s->{skip} .. $end - $s->{start} + $s->{skip} - 1];
+       }
+    }
+ 
+@@ -331,11 +360,117 @@
+       ($event->{state} & $mask) == $self->{state});
+ }
+ 
++# characters a hard-wrapped match may continue with (same set as $url)
++my $urlchar = qr{[\w\-\@;\/?:&=%\$.+!*\x27,~#$urxvt::NOCHAR]};
++
++# width of the longest visible row, used as an estimate of the column
++# the application wraps at
++sub wrap_width {
++   my ($self) = @_;
++
++   my $width = 0;
++   for my $row (0 .. $self->nrow - 1) {
++      (my $text = $self->ROW_t ($row)) =~ s/\s+$//;
++      $width = length $text if length $text > $width;
++   }
++
++   $width
++}
++
++# whether $next is a hard-wrapped continuation of $prev
++sub joins {
++   my ($self, $prev, $next) = @_;
++
++   (my $pt = $prev->t) =~ s/\s+$//;
++   my $nt = $next->t;
++
++   return unless $pt =~ /$urlchar$/ && $nt =~ /^\s*$urlchar/;
++
++   my $width = $self->wrap_width;
++
++   length $pt >= $width - 1
++      || (length $pt >= $width - 12 && $pt =~ /-$/)
++}
++
++# text of the logical line containing $row, joined with hard-wrapped
++# neighbours when join-wrapped is set, and the segments mapping offsets
++# in that text back to lines
++sub joined_line {
++   my ($self, $row) = @_;
++
++   my $line = $self->line ($row);
++
++   return ($line->t, [{ line => $line, start => 0, skip => 0, len => $line->l }])
++      unless $self->{join_wrapped};
++
++   my @chain = ($line);
++
++   for (1 .. 8) {
++      last if $chain[0]->beg <= $self->top_row;
++      my $prev = $self->line ($chain[0]->beg - 1);
++      last unless $self->joins ($prev, $chain[0]);
++      unshift @chain, $prev;
++   }
++
++   for (1 .. 8) {
++      last if $chain[-1]->end >= $self->nrow - 1;
++      my $next = $self->line ($chain[-1]->end + 1);
++      last unless $self->joins ($chain[-1], $next);
++      push @chain, $next;
++   }
++
++   my $text = "";
++   my @seg;
++
++   for my $l (@chain) {
++      my $t = $l->t;
++      my $skip = 0;
++
++      if (@seg && $t =~ /^(\s+)/) {
++         $skip = length $1;
++         substr $t, 0, $skip, "";
++      }
++
++      $t =~ s/\s+$// if $l != $chain[-1];
++
++      push @seg, { line => $l, start => length $text, skip => $skip, len => length $t };
++      $text .= $t;
++   }
++
++   ($text, \@seg)
++}
++
++sub seg_offset_of {
++   my ($self, $seg, $row, $col) = @_;
++
++   for my $s (@$seg) {
++      next if $row < $s->{line}->beg || $row > $s->{line}->end;
++      my $off = $s->{line}->offset_of ($row, $col) - $s->{skip};
++      return $off < 0 || $off >= $s->{len} ? undef : $s->{start} + $off;
++   }
++
++   undef
++}
++
++# $end selects the segment an offset on a boundary belongs to: the
++# preceding one for the end of a match, the following one for its start
++sub seg_coord_of {
++   my ($self, $seg, $off, $end) = @_;
++
++   for my $s (@$seg) {
++      next if $end ? $off > $s->{start} + $s->{len} : $off >= $s->{start} + $s->{len};
++      return $s->{line}->coord_of ($off - $s->{start} + $s->{skip});
++   }
++
++   $seg->[-1]{line}->coord_of ($seg->[-1]{len} + $seg->[-1]{skip})
++}
++
+ sub find_matches {
+    my ($self, $row, $col) = @_;
+-   my $line = $self->line ($row);
+-   my $text = $line->t;
+-   my $off = $line->offset_of ($row, $col) if defined $col;
++   my ($text, $seg) = $self->joined_line ($row);
++   my $off = $self->seg_offset_of ($seg, $row, $col) if defined $col;
++
++   return if defined $col && !defined $off;
+ 
+    my @matches;
+    for my $matcher (@{$self->{matchers}}) {
+@@ -360,7 +495,7 @@
+                   } split /\s+/, $launcher;
+             }
+ 
+-            push @matches, [ $line->coord_of ($begin[0]), $line->coord_of ($end[0]), $match, @exec ];
++            push @matches, [ $self->seg_coord_of ($seg, $begin[0]), $self->seg_coord_of ($seg, $end[0], 1), $match, @exec ];
+          }
+       }
+    }

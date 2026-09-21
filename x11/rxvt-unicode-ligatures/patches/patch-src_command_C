@@ -1,0 +1,339 @@
+OSC colour queries: terminate the reply with the same sequence used in
+the query (ST, ESC \ or BEL), from upstream.
+
+24-bit colour (SGR 38;2 / 48;2), wide glyphs, OSC 110/111/112 to reset
+foreground, background and cursor colours.
+
+Index: src/command.C
+--- src/command.C.orig
++++ src/command.C
+@@ -237,7 +237,9 @@
+ # endif
+       scr_overlay_set (11, y + 1, ch, r);
+ 
++#if !ENABLE_WIDE_GLYPHS
+       if (WCWIDTH (ch) >= 2)
++#endif
+         scr_overlay_set (12, y + 1, NOCHAR, r);
+     }
+ 
+@@ -1824,11 +1826,11 @@
+   if (rs[Rs_fade])
+     {
+       if (!first_time)
+-        pix_colors_focused [idx].free (this);
++        lookup_color(idx, pix_colors_focused).free (this);
+ 
+       rgba c;
+-      pix_colors [Color_fade].get (c);
+-      pix_colors_focused [idx].fade (this, atoi (rs[Rs_fade]), pix_colors_unfocused [idx], c);
++      lookup_color(Color_fade, pix_colors).get (c);
++      lookup_color(idx, pix_colors_focused).fade (this, atoi (rs[Rs_fade]), lookup_color(idx, pix_colors_unfocused), c);
+     }
+ #endif
+ }
+@@ -3021,8 +3023,13 @@
+                 tt_printf ("%-.250s\012", rs[Rs_display_name]);
+               break;
+             case 8:			/* unofficial extension */
+-              process_xterm_seq (XTerm_title, (char *)RESNAME "-" VERSION, CHAR_ST); // char * cast verified
+-              break;
++              {
++                string_term st;
++                st.v[0] = CHAR_ST;
++                st.v[1] = '\0';
++                process_xterm_seq (XTerm_title, (char *)RESNAME "-" VERSION, st); // char * cast verified
++                break;
++              }
+           }
+         break;
+ 
+@@ -3217,7 +3224,7 @@
+  * ends_how is terminator used. returned input must be free()'d
+  */
+ char *
+-rxvt_term::get_to_st (unicode_t &ends_how)
++rxvt_term::get_to_st (string_term &st)
+ {
+   unicode_t ch;
+   bool seen_esc = false;
+@@ -3256,7 +3263,11 @@
+ 
+   string[n++] = '\0';
+ 
+-  ends_how = (ch == 0x5c ? C0_ESC : ch);
++  n = 0;
++  if (ch == 0x5c)
++    st.v[n++] = C0_ESC;
++  st.v[n++] = ch;
++  st.v[n] = '\0';
+ 
+   return rxvt_wcstombs (string);
+ }
+@@ -3272,8 +3283,8 @@
+    * Not handled yet
+    */
+ 
+-  unicode_t eh;
+-  char *s = get_to_st (eh);
++  string_term st;
++  char *s = get_to_st (st);
+   if (s)
+     free (s);
+ 
+@@ -3288,22 +3299,22 @@
+ rxvt_term::process_osc_seq ()
+ {
+   int arg;
++  string_term st;
++  char *s;
+ 
+-  unicode_t ch = cmd_getc ();
+-  for (arg = 0; isdigit (ch); ch = cmd_getc ())
+-    arg = arg * 10 + (ch - '0');
++  s = get_to_st (st);
++  if (!s)
++    return;
+ 
+-  if (ch == ';')
+-    {
+-      unicode_t eh;
+-      char *s = get_to_st (eh);
++  char *ch = s;
++  for (arg = 0; isdigit (ch[0]); ch++)
++    arg = arg * 10 + (*ch - '0');
+ 
+-      if (s)
+-        {
+-          process_xterm_seq (arg, s, eh);
+-          free (s);
+-        }
+-    }
++  if (*ch == ';')
++    ch++;
++
++  process_xterm_seq (arg, ch, st);
++  free (s);
+ }
+ 
+ static unsigned int
+@@ -3410,12 +3421,12 @@
+ }
+ 
+ void
+-rxvt_term::process_color_seq (int report, int color, const char *str, char resp)
++rxvt_term::process_color_seq (int report, int color, const char *str, string_term &st)
+ {
+   if (str[0] == '?' && !str[1])
+     {
+       rgba c;
+-      pix_colors_focused[color].get (c);
++      lookup_color(color, pix_colors_focused).get (c);
+       char rgba_str[32];
+ 
+ #if XFT
+@@ -3426,9 +3437,9 @@
+         snprintf (rgba_str, sizeof (rgba_str), "rgb:%04x/%04x/%04x", c.r, c.g, c.b);
+ 
+       if (IN_RANGE_INC (color, minCOLOR, maxTermCOLOR))
+-        tt_printf ("\033]%d;%d;%s%c", report, color - minCOLOR, rgba_str, resp);
++        tt_printf ("\033]%d;%d;%s%s", report, color - minCOLOR, rgba_str, st.v);
+       else
+-        tt_printf ("\033]%d;%s%c", report, rgba_str, resp);
++        tt_printf ("\033]%d;%s%s", report, rgba_str, st.v);
+     }
+   else
+     set_window_color (color, str);
+@@ -3438,7 +3449,7 @@
+  * XTerm escape sequences: ESC ] Ps;Pt (ST|BEL)
+  */
+ void
+-rxvt_term::process_xterm_seq (int op, char *str, char resp)
++rxvt_term::process_xterm_seq (int op, char *str, string_term &st)
+ {
+   int color;
+   char *buf, *name;
+@@ -3452,6 +3463,13 @@
+   if (HOOK_INVOKE ((this, HOOK_OSC_SEQ, DT_INT, op, DT_STR, str, DT_END)))
+     return;
+ 
++  // These operations take no parameters and expect empty string.
++  if (strlen (str) == 0 &&
++      op != XTerm_RestoreColor00 &&
++      op != XTerm_RestoreColor01 &&
++      op != XTerm_RestoreColor_cursor)
++    return;
++
+   switch (op)
+     {
+       case XTerm_name:
+@@ -3483,7 +3501,7 @@
+                 && actual_format == 8)
+               str = (const char *)(value);
+ 
+-            tt_printf ("\033]%d;%s%c", op, option (Opt_insecure) ? str : "", resp);
++            tt_printf ("\033]%d;%s%s", op, option (Opt_insecure) ? str : "", st.v);
+ 
+             XFree (value);
+           }
+@@ -3517,49 +3535,52 @@
+             if ((buf = strchr (name, ';')) != NULL)
+               *buf++ = '\0';
+ 
+-            process_color_seq (op, color, name, resp);
++            process_color_seq (op, color, name, st);
+           }
+         break;
+       case Rxvt_restoreFG:
+       case XTerm_Color00:
+-        process_color_seq (op, Color_fg, str, resp);
++      case XTerm_RestoreColor00:
++        process_color_seq (op, Color_fg, str, st);
+         break;
+       case Rxvt_restoreBG:
+       case XTerm_Color01:
+-        process_color_seq (op, Color_bg, str, resp);
++      case XTerm_RestoreColor01:
++        process_color_seq (op, Color_bg, str, st);
+         break;
+ #ifndef NO_CURSORCOLOR
+       case XTerm_Color_cursor:
+-        process_color_seq (op, Color_cursor, str, resp);
++      case XTerm_RestoreColor_cursor:
++        process_color_seq (op, Color_cursor, str, st);
+         break;
+ #endif
+       case XTerm_Color_pointer_fg:
+-        process_color_seq (op, Color_pointer_fg, str, resp);
++        process_color_seq (op, Color_pointer_fg, str, st);
+         break;
+       case XTerm_Color_pointer_bg:
+-        process_color_seq (op, Color_pointer_bg, str, resp);
++        process_color_seq (op, Color_pointer_bg, str, st);
+         break;
+ #ifdef OPTION_HC
+       case XTerm_Color_HC:
+-        process_color_seq (op, Color_HC, str, resp);
++        process_color_seq (op, Color_HC, str, st);
+         break;
+       case XTerm_Color_HTC:
+-        process_color_seq (op, Color_HTC, str, resp);
++        process_color_seq (op, Color_HTC, str, st);
+         break;
+ #endif
+ #ifndef NO_BOLD_UNDERLINE_REVERSE
+       case URxvt_Color_BD:
+-        process_color_seq (op, Color_BD, str, resp);
++        process_color_seq (op, Color_BD, str, st);
+         break;
+       case URxvt_Color_UL:
+-        process_color_seq (op, Color_UL, str, resp);
++        process_color_seq (op, Color_UL, str, st);
+         break;
+       case URxvt_Color_IT:
+-        process_color_seq (op, Color_IT, str, resp);
++        process_color_seq (op, Color_IT, str, st);
+         break;
+ #endif
+       case URxvt_Color_border:
+-        process_color_seq (op, Color_border, str, resp);
++        process_color_seq (op, Color_border, str, st);
+         break;
+ 
+       case XTerm_logfile:
+@@ -3587,10 +3608,10 @@
+       case URxvt_boldItalicFont:
+ #endif
+         if (query)
+-          tt_printf ("\33]%d;%-.250s%c", saveop,
++          tt_printf ("\33]%d;%-.250s%s", saveop,
+                      option (Opt_insecure) && fontset[op - URxvt_font]->fontdesc
+                        ? fontset[op - URxvt_font]->fontdesc : "",
+-                     resp);
++                     st.v);
+         else
+           {
+             const char *&res = rs[Rs_font + (op - URxvt_font)];
+@@ -3603,23 +3624,23 @@
+ 
+       case URxvt_version:
+         if (query)
+-          tt_printf ("\33]%d;rxvt-unicode;%-.20s;%c;%c%c",
++          tt_printf ("\33]%d;rxvt-unicode;%-.20s;%c;%c%s",
+                      op,
+                      rs[Rs_name], VERSION[0], VERSION[2],
+-                     resp);
++                     st.v);
+         break;
+ 
+ #if !ENABLE_MINIMAL
+       case URxvt_cellinfo:
+         if (query)
+-          tt_printf ("\33]%d;%d;%d;%d%c", saveop,
++          tt_printf ("\33]%d;%d;%d;%d%s", saveop,
+                      fwidth, fheight, fbase,
+-                     resp);
++                     st.v);
+         break;
+ 
+       case URxvt_locale:
+         if (query)
+-          tt_printf ("\33]%d;%-.250s%c", op, option (Opt_insecure) ? locale : "", resp);
++          tt_printf ("\33]%d;%-.250s%s", op, option (Opt_insecure) ? locale : "", st.v);
+         else
+           {
+             set_locale (str);
+@@ -3644,7 +3665,7 @@
+ 
+ #if ENABLE_PERL
+       case URxvt_perl:
+-        HOOK_INVOKE ((this, HOOK_OSC_SEQ_PERL, DT_STR, str, DT_STR_LEN, &resp, 1, DT_END));
++        HOOK_INVOKE ((this, HOOK_OSC_SEQ_PERL, DT_STR, str, DT_STR, st.v, DT_END));
+         break;
+ #endif
+     }
+@@ -3924,7 +3945,7 @@
+ {
+   unsigned int i;
+   short rendset;
+-  int rendstyle;
++  rend_t rendstyle;
+ 
+   if (nargs == 0)
+     {
+@@ -4030,6 +4051,20 @@
+             break;
+ 
+           case 38: // set fg color, ISO 8613-6
++#if USE_24_BIT_COLOR
++            if (nargs > i + 2 && arg[i + 1] == 5)
++              {
++                scr_color ((unsigned int) (minCOLOR + arg[i + 2]), Color_fg);
++                i += 2;
++              }
++            else if (nargs > i + 4 && arg[i + 1] == 2)
++              {
++                unsigned int r = arg[i + 2], g = arg[i + 3], b = arg[i + 4];
++                scr_color_rgb (r, g, b, Color_fg);
++                i += 4;
++              }
++#endif
++            break;
+           case 48: // set bg color, ISO 8613-6
+             {
+               unsigned int fgbg = arg[i] == 38 ? Color_fg : Color_bg;
+@@ -4042,6 +4077,14 @@
+ 
+                   scr_color (idx, fgbg);
+                 }
++#if USE_24_BIT_COLOR
++              else if (nargs > i + 4 && arg[i + 1] == 2)
++                {
++                  unsigned int r = arg[i + 2], g = arg[i + 3], b = arg[i + 4];
++                  scr_color_rgb (r, g, b, Color_bg);
++                  i += 4;
++                }
++#endif
+               else if (nargs > i + 4 && arg[i + 1] == 2)
+                 {
+                   unsigned int r = arg[i + 2];
