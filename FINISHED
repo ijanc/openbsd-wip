@@ -5,3 +5,4 @@
 
 x11/rxvt-unicode-ligatures	ready for import, tested on amd64 -current, not sent to ports@ (ijanc)
 x11/urxvt-perls			ready for import, tested on amd64 -current, not sent to ports@ (ijanc)
+devel/cargo-generate		ready for import, tested on amd64 -current, not sent to ports@ (ijanc)

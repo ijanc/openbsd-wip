@@ -1,0 +1,4 @@
+cargo-generate is a developer tool to get up and running quickly with a
+new Rust project by leveraging a pre-existing git repository as a
+template. Templates use the Liquid language for placeholders and can be
+customized with Rhai scripts.
